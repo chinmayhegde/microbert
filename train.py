@@ -63,11 +63,16 @@ def train_epoch(model, dataloader, optimizer, criterion, device):
     
     return total_loss / len(dataloader)
 
-
 def evaluate_mlm(model, tokenizer, sample_text, device):
     model.eval()
     
     input_ids = tokenizer.encode(sample_text, max_length=512)
+    
+    # Find the actual length by looking for the first padding token
+    actual_length = len(input_ids)
+    if tokenizer.char_to_idx['[PAD]'] in input_ids:
+        actual_length = input_ids.tolist().index(tokenizer.char_to_idx['[PAD]'])
+    
     masked_input_ids, labels = tokenizer.create_mlm_mask(input_ids.clone(), mlm_probability=0.15)
     
     masked_input_ids = masked_input_ids.unsqueeze(0).to(device)
@@ -80,17 +85,37 @@ def evaluate_mlm(model, tokenizer, sample_text, device):
     masked_positions = (labels[0] != -100).nonzero(as_tuple=True)[0]
     
     results = []
+    correct_count = 0
     for pos in masked_positions:
+        if pos >= actual_length:  # Skip positions beyond actual text
+            continue
         original_char = tokenizer.idx_to_char[labels[0, pos].item()]
         predicted_char = tokenizer.idx_to_char[predictions[0, pos].item()]
+        is_correct = original_char == predicted_char
+        if is_correct:
+            correct_count += 1
         results.append({
             'position': pos.item(),
             'original': original_char,
             'predicted': predicted_char,
-            'correct': original_char == predicted_char
+            'correct': is_correct
         })
     
-    return results, tokenizer.decode(masked_input_ids[0]), tokenizer.decode(predictions[0])
+    accuracy = correct_count / len(results) if len(results) > 0 else 0
+    
+    # Create reconstructed text: use original for unmasked, predictions for masked
+    reconstructed_ids = input_ids.clone()
+    for pos in masked_positions:
+        if pos < actual_length:
+            reconstructed_ids[pos] = predictions[0, pos]
+    
+    # Only decode up to the actual text length
+    masked_text_display = tokenizer.decode(masked_input_ids[0][:actual_length])
+    predicted_text_display = tokenizer.decode(reconstructed_ids[:actual_length])
+    
+    return results, masked_text_display, predicted_text_display, accuracy
+
+
 
 
 def main():
@@ -128,7 +153,7 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=5e-4)
     
     print("\nStarting training...")
-    num_epochs = 5
+    num_epochs = 20
     
     for epoch in range(num_epochs):
         print(f"\nEpoch {epoch + 1}/{num_epochs}")
@@ -138,17 +163,13 @@ def main():
         if (epoch + 1) % 2 == 0:
             print("\nEvaluating MLM predictions...")
             sample = "To be, or not to be, that is the question"
-            results, masked_text, predicted_text = evaluate_mlm(model, tokenizer, sample, device)
+            results, masked_text, predicted_text, accuracy = evaluate_mlm(model, tokenizer, sample, device)
             
             print(f"Original: {sample}")
             print(f"Masked: {masked_text}")
             print(f"Predicted: {predicted_text}")
-            
-            correct = sum(1 for r in results if r['correct'])
-            total = len(results)
-            accuracy = correct / total if total > 0 else 0
-            
-            print(f"\nMasked predictions ({correct}/{total} correct, {accuracy:.1%} accuracy):")
+            print(f"\n {accuracy:.1%} accuracy):")
+
             for r in results[:5]:
                 status = "✓" if r['correct'] else "✗"
                 print(f"  Position {r['position']}: '{r['original']}' -> '{r['predicted']}' {status}")
